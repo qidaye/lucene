@@ -1212,6 +1212,93 @@ abstract class HnswGraphTestCase<T> extends LuceneTestCase {
     expectThrows(IllegalStateException.class, () -> builder.build(size));
   }
 
+  /**
+   * A node whose level is above the graph's max level must retry its insertion when another thread
+   * promotes a new entry node first. Simulates that race on a single thread and checks that the
+   * retry still scores against the node being inserted.
+   */
+  public void testRetryAfterLosingEntryNodePromotion() throws IOException {
+    similarityFunction = VectorSimilarityFunction.EUCLIDEAN;
+    int size = 64;
+    KnnVectorValues vectors = vectorValues(size, 16);
+    RandomVectorScorerSupplier scorerSupplier = buildScorerSupplier(vectors);
+    OnHeapHnswGraph hnsw = new OnHeapHnswGraph(2, size);
+    // reserved for the simulated concurrent insertion
+    int otherNode = size - 1;
+    int[] inserting = {-1};
+    int[] promotedLevel = {-1};
+    UpdateableRandomVectorScorer delegate = scorerSupplier.scorer();
+    UpdateableRandomVectorScorer racingScorer =
+        new UpdateableRandomVectorScorer() {
+          @Override
+          public void setScoringOrdinal(int ord) throws IOException {
+            int inserted = inserting[0];
+            int maxLevel = hnsw.numLevels() - 1;
+            // the node being inserted is now linking its neighbors and will try to promote itself
+            // afterwards, let another thread win the promotion first
+            if (promotedLevel[0] == -1
+                && ord != inserted
+                && hnsw.nodeExistAtLevel(maxLevel + 1, inserted)) {
+              for (int level = 0; level <= maxLevel + 1; level++) {
+                hnsw.addNode(level, otherNode);
+              }
+              assertTrue(hnsw.tryPromoteNewEntryNode(otherNode, maxLevel + 1, maxLevel));
+              promotedLevel[0] = maxLevel + 1;
+            }
+            delegate.setScoringOrdinal(ord);
+          }
+
+          @Override
+          public float score(int node) throws IOException {
+            return delegate.score(node);
+          }
+
+          @Override
+          public int maxOrd() {
+            return delegate.maxOrd();
+          }
+        };
+    RandomVectorScorerSupplier racingSupplier =
+        new RandomVectorScorerSupplier() {
+          @Override
+          public UpdateableRandomVectorScorer scorer() {
+            return racingScorer;
+          }
+
+          @Override
+          public RandomVectorScorerSupplier copy() {
+            throw new UnsupportedOperationException();
+          }
+        };
+    HnswGraphBuilder builder = new HnswGraphBuilder(racingSupplier, 10, random().nextLong(), hnsw);
+    // start from a single level graph, so that every node above level 0 tries to promote itself
+    hnsw.addNode(0, 0);
+    assertTrue(hnsw.trySetNewEntryNode(0, 0));
+    int node = 0;
+    while (promotedLevel[0] == -1) {
+      node++;
+      assertTrue("no node tried to promote itself", node < otherNode);
+      inserting[0] = node;
+      builder.addGraphNode(node);
+    }
+    // the retry linked the node on the new level
+    assertTrue(hnsw.getNeighbors(promotedLevel[0], node).size() > 0);
+
+    UpdateableRandomVectorScorer scorer = scorerSupplier.scorer();
+    scorer.setScoringOrdinal(node);
+    for (int level = 0; hnsw.nodeExistAtLevel(level, node); level++) {
+      NeighborArray neighbors = hnsw.getNeighbors(level, node);
+      for (int i = 0; i < neighbors.size(); i++) {
+        int neighbor = neighbors.nodes()[i];
+        assertEquals(
+            "score of " + node + " -> " + neighbor + " on level " + level,
+            scorer.score(neighbor),
+            neighbors.getScores(i),
+            0f);
+      }
+    }
+  }
+
   private static final int MERGE_DIM = 16;
   private static final int MERGE_M = 16;
   private static final int MERGE_BEAM_WIDTH = 100;

@@ -388,6 +388,8 @@ public class HnswGraphBuilder implements HnswBuilder {
                 + curMaxLevel
                 + " has not changed while we are inserting the node.");
       }
+      // Linking the node moved the scorer to other nodes, point it back before searching again
+      scorer.setScoringOrdinal(node);
     } while (true);
   }
 
